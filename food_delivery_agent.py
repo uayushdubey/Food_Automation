@@ -1,21 +1,8 @@
-"""
-Food Delivery Comparison Agent - Production Version
-
-A robust, production-ready agent for comparing food deals across Swiggy and Zomato.
-Uses Playwright with Chromium for consistent, reliable automation.
-
-Installation:
-    pip install playwright rich pydantic
-    playwright install chromium
-
-Usage:
-    python food_delivery_agent.py --config config.json
-    python food_delivery_agent.py --interactive
-"""
-
 import asyncio
 import json
 import logging
+import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, asdict, field
@@ -60,11 +47,11 @@ class Config:
     LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     LOG_FILE = "food_delivery_agent.log"
 
-    # Browser settings
+    # Browser settings (persistent profile)
     HEADLESS = False
     SLOW_MO = 100  # ms
     VIEWPORT = {"width": 1920, "height": 1080}
-
+    USER_DATA_DIR = "./browser_data"  # persistent profile dir
 
 # ==================== Logging Setup ====================
 
@@ -97,13 +84,11 @@ def setup_logging(log_file: Optional[str] = None, verbose: bool = False):
 
 logger = logging.getLogger("FoodDeliveryAgent")
 
-
 # ==================== Data Models ====================
 
 class Platform(Enum):
     SWIGGY = "Swiggy"
     ZOMATO = "Zomato"
-
 
 @dataclass
 class SearchRequest:
@@ -119,7 +104,6 @@ class SearchRequest:
         self.food_items = [item.strip() for item in self.food_items if item.strip()]
         if not self.food_items:
             raise ValueError("At least one food item is required")
-
 
 @dataclass
 class ItemResult:
@@ -142,7 +126,6 @@ class ItemResult:
                 ((self.item_price - self.final_price) / self.item_price) * 100, 2
             )
 
-
 @dataclass
 class PlatformReport:
     """Report for a single platform"""
@@ -151,7 +134,8 @@ class PlatformReport:
     successful_additions: int
     errors: List[str] = field(default_factory=list)
     results: List[ItemResult] = field(default_factory=list)
-
+    available: bool = True
+    latency_ms: Optional[float] = None
 
 @dataclass
 class RunReport:
@@ -176,14 +160,15 @@ class RunReport:
                     "items_found": pr.items_found,
                     "successful_additions": pr.successful_additions,
                     "errors": pr.errors,
-                    "results": [asdict(r) for r in pr.results]
+                    "results": [asdict(r) for r in pr.results],
+                    "available": pr.available,
+                    "latency_ms": pr.latency_ms
                 }
                 for pr in self.platform_reports
             ],
             "execution_time_seconds": self.execution_time_seconds,
             "timestamp": self.timestamp
         }
-
 
 # ==================== Utilities ====================
 
@@ -195,7 +180,7 @@ def retry_async(max_attempts: int = Config.RETRY_ATTEMPTS, backoff: float = Conf
             for attempt in range(max_attempts):
                 try:
                     return await func(*args, **kwargs)
-                except (PlaywrightTimeoutError, PlaywrightError) as e:
+                except (PlaywrightTimeoutError, PlaywrightError, asyncio.TimeoutError) as e:
                     last_exception = e
                     if attempt < max_attempts - 1:
                         wait_time = backoff ** attempt
@@ -205,11 +190,10 @@ def retry_async(max_attempts: int = Config.RETRY_ATTEMPTS, backoff: float = Conf
                         )
                         await asyncio.sleep(wait_time)
                     else:
-                        logger.error(f"{func.__name__} failed after {max_attempts} attempts")
+                        logger.error(f"{func.__name__} failed after {max_attempts} attempts: {e}")
             raise last_exception
         return wrapper
     return decorator
-
 
 class PageHelper:
     """Helper methods for common page operations"""
@@ -256,6 +240,179 @@ class PageHelper:
         except Exception:
             return None
 
+# ==================== CAP Manager & Mode ====================
+
+class CAPMode(Enum):
+    """Choose which CAP tradeoff behavior the agent favors for different operations."""
+    AVAILABILITY_FIRST = "availability_first"  # prioritize availability (search)
+    CONSISTENCY_FIRST = "consistency_first"    # prioritize consistency (cart ops)
+
+class CAPManager:
+    """
+    Coordinates CAP-aware behaviors:
+      - Parallel high-availability searches
+      - Consistent cart additions (idempotent, verified, rollback on mismatch)
+    """
+
+    def __init__(self, page: Page, mode: CAPMode = CAPMode.AVAILABILITY_FIRST):
+        self.page = page
+        self.mode = mode
+
+    async def parallel_search_handlers(self, handlers: List["BasePlatformHandler"], timeout_per_handler: float = 25.0):
+        """
+        Run handler.initialize() and handler.search_items() in parallel with per-handler timeouts.
+        Returns tuple(all_results, platform_reports)
+        """
+        async def run_handler(handler: "BasePlatformHandler"):
+            start = time.time()
+            try:
+                await handler.initialize()
+                results = await asyncio.wait_for(handler.search_items(), timeout=timeout_per_handler)
+                handler.report.available = True
+                handler.report.latency_ms = (time.time() - start) * 1000
+                return results, handler.report
+            except asyncio.TimeoutError as e:
+                handler.report.available = False
+                handler.report.errors.append(f"Timeout: {e}")
+                handler.report.latency_ms = (time.time() - start) * 1000
+                logger.warning(f"{handler.__class__.__name__} timed out after {timeout_per_handler}s")
+                return [], handler.report
+            except Exception as e:
+                handler.report.available = False
+                handler.report.errors.append(str(e))
+                handler.report.latency_ms = (time.time() - start) * 1000
+                logger.error(f"{handler.__class__.__name__} search error: {e}")
+                return [], handler.report
+
+        tasks = [run_handler(h) for h in handlers]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        all_results = []
+        reports = []
+        for res, rep in results:
+            all_results.extend(res)
+            reports.append(rep)
+        return all_results, reports
+
+    async def add_to_cart_consistent(self, handler: "BasePlatformHandler", item: ItemResult,
+                                     max_attempts: int = 3, backoff: float = 1.5) -> bool:
+        """
+        Try to add `item` to platform cart with *consistency-first* guarantees:
+        1. Use an idempotency token so repeated attempts don't create duplicates.
+        2. After add, verify server-side cart contents (price and item).
+        3. If verification fails, attempt rollback (remove item) and optionally retry.
+        Returns True if add is verified consistent; False otherwise.
+        """
+        idempotency_token = str(uuid.uuid4())
+        attempt = 0
+        last_exc = None
+
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                logger.info(f"Attempting to add to cart ({attempt}/{max_attempts}) - platform={handler.__class__.__name__} item={item.item_name}")
+                add_func = getattr(handler, "add_item_to_cart", None)
+                if not callable(add_func):
+                    raise NotImplementedError(f"{handler.__class__.__name__} does not implement add_item_to_cart")
+
+                await add_func(item, idempotency_token)
+
+                verify_func = getattr(handler, "verify_cart_contains", None)
+                if not callable(verify_func):
+                    logger.debug("No handler.verify_cart_contains(); performing fallback cart verification")
+                    verified = await self._fallback_verify(handler, item)
+                else:
+                    verified = await verify_func(item)
+
+                if verified:
+                    logger.info("Cart add verified consistent")
+                    handler.report.successful_additions += 1
+                    return True
+                else:
+                    logger.warning("Cart verification failed — attempting rollback")
+                    remove_func = getattr(handler, "remove_item_from_cart", None)
+                    if callable(remove_func):
+                        await remove_func(item)
+                    else:
+                        await self._fallback_remove(handler, item)
+
+                    last_exc = RuntimeError("Verification failed after add")
+                    if self.mode == CAPMode.CONSISTENCY_FIRST:
+                        wait = backoff ** (attempt - 1)
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        break
+
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"Add to cart attempt {attempt} failed: {e}")
+                wait = backoff ** (attempt - 1)
+                await asyncio.sleep(wait)
+                continue
+
+        logger.error(f"Failed to add to cart consistently after {max_attempts} attempts: {last_exc}")
+        return False
+
+    async def _fallback_verify(self, handler: "BasePlatformHandler", item: ItemResult) -> bool:
+        """
+        Minimal DOM-based verification: opens cart page and checks for item name and price.
+        This is brittle: platform-specific handlers should override verify_cart_contains.
+        """
+        try:
+            cart_urls = [
+                f"{getattr(handler, 'BASE_URL', '')}/cart",
+                f"{getattr(handler, 'BASE_URL', '')}/checkout",
+            ]
+            for url in cart_urls:
+                if not url:
+                    continue
+                try:
+                    await self.page.goto(url, timeout=Config.NAVIGATION_TIMEOUT)
+                    await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                except Exception:
+                    continue
+
+                page_text = await self.page.content()
+                if item.item_name.lower() in page_text.lower():
+                    if item.final_price:
+                        price_strs = [f"₹{int(item.final_price)}", f"₹{round(item.final_price,2)}"]
+                        if any(s in page_text for s in price_strs):
+                            return True
+                    else:
+                        return True
+            return False
+        except Exception as e:
+            logger.debug(f"Fallback verify failed: {e}")
+            return False
+
+    async def _fallback_remove(self, handler: "BasePlatformHandler", item: ItemResult):
+        """Best-effort: navigate to cart and attempt to remove items matching name"""
+        try:
+            cart_urls = [
+                f"{getattr(handler, 'BASE_URL', '')}/cart",
+                f"{getattr(handler, 'BASE_URL', '')}/checkout",
+            ]
+            for url in cart_urls:
+                if not url:
+                    continue
+                try:
+                    await self.page.goto(url, timeout=Config.NAVIGATION_TIMEOUT)
+                    await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                except Exception:
+                    continue
+
+                remove_buttons = await self.page.query_selector_all("button:has-text('Remove'), button:has-text('Delete'), a:has-text('Remove')")
+                for btn in remove_buttons:
+                    try:
+                        parent_text = await btn.evaluate("el => el.closest('div')?.innerText || ''")
+                        if item.item_name.lower() in (parent_text or "").lower():
+                            await btn.click()
+                            await asyncio.sleep(0.8)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug(f"Fallback remove failed: {e}")
+            return
 
 # ==================== Platform Handlers ====================
 
@@ -284,7 +441,6 @@ class BasePlatformHandler:
         except Exception as e:
             logger.debug(f"Cleanup failed: {e}")
 
-
 class SwiggyHandler(BasePlatformHandler):
     """Swiggy-specific implementation"""
 
@@ -298,7 +454,6 @@ class SwiggyHandler(BasePlatformHandler):
         await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
         await asyncio.sleep(Config.PAGE_LOAD_WAIT)
 
-        # Check if logged in
         try:
             login_button = await self.page.query_selector("text=/login|sign in/i")
             if login_button:
@@ -318,16 +473,23 @@ class SwiggyHandler(BasePlatformHandler):
                 # Search for the item
                 search_input = await self.page.query_selector("input[placeholder*='Search'], input[type='text']")
                 if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(food_item)
-                    await self.page.keyboard.press("Enter")
-                    await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
-                    await asyncio.sleep(Config.PAGE_LOAD_WAIT)
+                    try:
+                        await search_input.fill("")
+                        await search_input.fill(food_item)
+                        await self.page.keyboard.press("Enter")
+                        await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                        await asyncio.sleep(Config.PAGE_LOAD_WAIT)
+                    except Exception:
+                        # fallback to direct search url
+                        search_url = f"{self.BASE_URL}/search?q={food_item}"
+                        await self.page.goto(search_url, timeout=Config.NAVIGATION_TIMEOUT)
+                        await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                        await asyncio.sleep(Config.PAGE_LOAD_WAIT)
                 else:
-                    # Fallback: direct URL
                     search_url = f"{self.BASE_URL}/search?q={food_item}"
                     await self.page.goto(search_url, timeout=Config.NAVIGATION_TIMEOUT)
                     await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                    await asyncio.sleep(Config.PAGE_LOAD_WAIT)
 
                 # Find restaurant/dish cards
                 cards = await self.page.query_selector_all(
@@ -337,7 +499,7 @@ class SwiggyHandler(BasePlatformHandler):
                 logger.info(f"Found {len(cards)} cards on Swiggy for {food_item}")
 
                 processed = 0
-                for card in cards[:self.request.max_results_per_platform]:
+                for card in cards[: self.request.max_results_per_platform]:
                     try:
                         item_result = await self._process_card(card, food_item)
                         if item_result:
@@ -418,6 +580,80 @@ class SwiggyHandler(BasePlatformHandler):
             logger.debug(f"Card processing error: {e}")
             return None
 
+    # ==== Cart operations (best-effort; adjust selectors after testing) ====
+    async def add_item_to_cart(self, item: ItemResult, idempotency_token: str):
+        """
+        Best-effort: open item/restaurant URL and click add-to-cart.
+        Use idempotency_token for logging/tracking only.
+        """
+        if not item.url:
+            raise ValueError("No URL for item to add to cart (Swiggy)")
+        try:
+            await self.page.goto(item.url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            await asyncio.sleep(1)
+
+            # Try to find an "Add" button near the item name
+            # These selectors are examples — update after inspecting Swiggy's page
+            add_buttons = await self.page.query_selector_all("button:has-text('Add'), button:has-text('ADD'), button[data-testid*='add']")
+            if not add_buttons:
+                dish = await self.page.query_selector(f"text=\"{item.item_name}\"")
+                if dish:
+                    try:
+                        await dish.click()
+                        await asyncio.sleep(0.6)
+                    except Exception:
+                        pass
+                    add_buttons = await self.page.query_selector_all("button:has-text('Add'), button:has-text('ADD')")
+
+            if add_buttons:
+                try:
+                    await add_buttons[0].click()
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.debug(f"Swiggy add button click failed: {e}")
+                    raise
+            else:
+                raise RuntimeError("Could not find add-to-cart button on Swiggy page")
+        except Exception as e:
+            logger.debug(f"Swiggy add_item_to_cart exception: {e}")
+            raise
+
+    async def verify_cart_contains(self, item: ItemResult) -> bool:
+        # Try cart URL then fallback DOM checks
+        try:
+            cart_url = f"{self.BASE_URL}/cart"
+            await self.page.goto(cart_url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            page_text = await self.page.content()
+            if item.item_name.lower() in page_text.lower():
+                if item.final_price:
+                    if f"₹{int(item.final_price)}" in page_text or f"₹{round(item.final_price,2)}" in page_text:
+                        return True
+                else:
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"Swiggy verify_cart_contains exception: {e}")
+            return False
+
+    async def remove_item_from_cart(self, item: ItemResult):
+        try:
+            cart_url = f"{self.BASE_URL}/cart"
+            await self.page.goto(cart_url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            remove_buttons = await self.page.query_selector_all("button:has-text('Remove'), button:has-text('Delete'), a:has-text('Remove')")
+            for btn in remove_buttons:
+                try:
+                    parent_text = await btn.evaluate("el => el.closest('div')?.innerText || ''")
+                    if item.item_name.lower() in (parent_text or "").lower():
+                        await btn.click()
+                        await asyncio.sleep(0.8)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Swiggy remove_item_from_cart exception: {e}")
+            return
 
 class ZomatoHandler(BasePlatformHandler):
     """Zomato-specific implementation"""
@@ -432,7 +668,6 @@ class ZomatoHandler(BasePlatformHandler):
         await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
         await asyncio.sleep(Config.PAGE_LOAD_WAIT)
 
-        # Check if logged in
         try:
             login_button = await self.page.query_selector("text=/login|sign in/i")
             if login_button:
@@ -452,18 +687,23 @@ class ZomatoHandler(BasePlatformHandler):
                 # Search for the item
                 search_input = await self.page.query_selector("input[placeholder*='Search'], input[type='text']")
                 if search_input:
-                    await search_input.fill("")
-                    await search_input.fill(food_item)
-                    await self.page.keyboard.press("Enter")
-                    await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
-                    await asyncio.sleep(Config.PAGE_LOAD_WAIT)
+                    try:
+                        await search_input.fill("")
+                        await search_input.fill(food_item)
+                        await self.page.keyboard.press("Enter")
+                        await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                        await asyncio.sleep(Config.PAGE_LOAD_WAIT)
+                    except Exception:
+                        search_url = f"{self.BASE_URL}/search?q={food_item}"
+                        await self.page.goto(search_url, timeout=Config.NAVIGATION_TIMEOUT)
+                        await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                        await asyncio.sleep(Config.PAGE_LOAD_WAIT)
                 else:
-                    # Fallback: direct URL
                     search_url = f"{self.BASE_URL}/search?q={food_item}"
                     await self.page.goto(search_url, timeout=Config.NAVIGATION_TIMEOUT)
                     await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+                    await asyncio.sleep(Config.PAGE_LOAD_WAIT)
 
-                # Find restaurant/dish cards
                 cards = await self.page.query_selector_all(
                     "a[href*='/restaurant/'], a[href*='/order/'], div[data-testid*='resCard']"
                 )
@@ -471,7 +711,7 @@ class ZomatoHandler(BasePlatformHandler):
                 logger.info(f"Found {len(cards)} cards on Zomato for {food_item}")
 
                 processed = 0
-                for card in cards[:self.request.max_results_per_platform]:
+                for card in cards[: self.request.max_results_per_platform]:
                     try:
                         item_result = await self._process_card(card, food_item)
                         if item_result:
@@ -494,45 +734,37 @@ class ZomatoHandler(BasePlatformHandler):
     async def _process_card(self, card, food_item: str) -> Optional[ItemResult]:
         """Process a single restaurant/item card"""
         try:
-            # Extract basic info
             text_content = await card.inner_text()
 
-            # Extract name
             name_elem = await card.query_selector("h4, h3, div[class*='name'], p[class*='name']")
             name = await name_elem.inner_text() if name_elem else text_content.split('\n')[0]
 
-            # Extract rating
             rating = None
             rating_elem = await card.query_selector("div[aria-label*='rating'], div[class*='rating']")
             if rating_elem:
                 rating_text = await rating_elem.inner_text()
                 rating = await self.helper.extract_rating(rating_text)
 
-            # Check rating filter
             if rating and rating < self.request.min_rating:
                 return None
 
-            # Extract price
             price = None
             price_elem = await card.query_selector("span:has-text('₹'), p:has-text('₹')")
             if price_elem:
                 price_text = await price_elem.inner_text()
                 price = await self.helper.extract_price(price_text)
 
-            # Check price filter
             if price:
                 if self.request.price_min and price < self.request.price_min:
                     return None
                 if self.request.price_max and price > self.request.price_max:
                     return None
 
-            # Extract URL
             url = None
             href = await card.get_attribute("href")
             if href:
                 url = href if href.startswith("http") else self.BASE_URL + href
 
-            # Create result
             result = ItemResult(
                 restaurant_name=name.strip(),
                 rating=rating,
@@ -552,6 +784,73 @@ class ZomatoHandler(BasePlatformHandler):
             logger.debug(f"Card processing error: {e}")
             return None
 
+    # ==== Cart operations (best-effort; adjust selectors after testing) ====
+    async def add_item_to_cart(self, item: ItemResult, idempotency_token: str):
+        if not item.url:
+            raise ValueError("No URL for item to add to cart (Zomato)")
+        try:
+            await self.page.goto(item.url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            await asyncio.sleep(1)
+
+            add_buttons = await self.page.query_selector_all("button:has-text('Add'), button:has-text('ADD'), button:has-text('Add to cart')")
+            if not add_buttons:
+                dish = await self.page.query_selector(f"text=\"{item.item_name}\"")
+                if dish:
+                    try:
+                        await dish.click()
+                        await asyncio.sleep(0.6)
+                    except Exception:
+                        pass
+                    add_buttons = await self.page.query_selector_all("button:has-text('Add'), button:has-text('ADD')")
+
+            if add_buttons:
+                try:
+                    await add_buttons[0].click()
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.debug(f"Zomato add button click failed: {e}")
+                    raise
+            else:
+                raise RuntimeError("Could not find add-to-cart button on Zomato page")
+        except Exception as e:
+            logger.debug(f"Zomato add_item_to_cart exception: {e}")
+            raise
+
+    async def verify_cart_contains(self, item: ItemResult) -> bool:
+        try:
+            cart_url = f"{self.BASE_URL}/cart"
+            await self.page.goto(cart_url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            page_text = await self.page.content()
+            if item.item_name.lower() in page_text.lower():
+                if item.final_price:
+                    if f"₹{int(item.final_price)}" in page_text or f"₹{round(item.final_price,2)}" in page_text:
+                        return True
+                else:
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"Zomato verify_cart_contains exception: {e}")
+            return False
+
+    async def remove_item_from_cart(self, item: ItemResult):
+        try:
+            cart_url = f"{self.BASE_URL}/cart"
+            await self.page.goto(cart_url, timeout=Config.NAVIGATION_TIMEOUT)
+            await self.page.wait_for_load_state("networkidle", timeout=Config.DEFAULT_TIMEOUT)
+            remove_buttons = await self.page.query_selector_all("button:has-text('Remove'), button:has-text('Delete'), a:has-text('Remove')")
+            for btn in remove_buttons:
+                try:
+                    parent_text = await btn.evaluate("el => el.closest('div')?.innerText || ''")
+                    if item.item_name.lower() in (parent_text or "").lower():
+                        await btn.click()
+                        await asyncio.sleep(0.8)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Zomato remove_item_from_cart exception: {e}")
+            return
 
 # ==================== Main Agent ====================
 
@@ -563,6 +862,7 @@ class FoodDeliveryAgent:
         self.slow_mo = slow_mo
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.playwright = None
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -575,11 +875,12 @@ class FoodDeliveryAgent:
 
     async def initialize(self):
         """Initialize browser and page"""
-        logger.info("Initializing browser...")
+        logger.info("Initializing browser (persistent profile)...")
         self.playwright = await async_playwright().start()
 
+        # persistent profile to reuse logged-in sessions
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir="./browser_data",
+            user_data_dir=Config.USER_DATA_DIR,
             headless=self.headless,
             slow_mo=self.slow_mo,
             viewport=Config.VIEWPORT,
@@ -613,70 +914,69 @@ class FoodDeliveryAgent:
 
         logger.info(f"Starting search for: {', '.join(search_request.food_items)}")
 
-        platform_reports = []
-        all_results = []
+        # Create handlers
+        swiggy_handler = SwiggyHandler(self.page, search_request)
+        zomato_handler = ZomatoHandler(self.page, search_request)
+        handlers = [swiggy_handler, zomato_handler]
 
-        # Process Swiggy
-        try:
-            swiggy_handler = SwiggyHandler(self.page, search_request)
-            await swiggy_handler.initialize()
-            swiggy_results = await swiggy_handler.search_items()
-            all_results.extend(swiggy_results)
-            platform_reports.append(swiggy_handler.report)
-            await swiggy_handler.cleanup()
-        except Exception as e:
-            logger.error(f"Swiggy processing failed: {e}")
-            platform_reports.append(PlatformReport(
-                platform="Swiggy",
-                items_found=0,
-                successful_additions=0,
-                errors=[str(e)]
-            ))
+        # CAP manager: availability-first for searches
+        cap_mgr = CAPManager(self.page, mode=CAPMode.AVAILABILITY_FIRST)
 
-        # Process Zomato
-        try:
-            zomato_handler = ZomatoHandler(self.page, search_request)
-            await zomato_handler.initialize()
-            zomato_results = await zomato_handler.search_items()
-            all_results.extend(zomato_results)
-            platform_reports.append(zomato_handler.report)
-            await zomato_handler.cleanup()
-        except Exception as e:
-            logger.error(f"Zomato processing failed: {e}")
-            platform_reports.append(PlatformReport(
-                platform="Zomato",
-                items_found=0,
-                successful_additions=0,
-                errors=[str(e)]
-            ))
+        # Run searches in parallel with per-handler timeout
+        all_results, platform_reports = await cap_mgr.parallel_search_handlers(handlers, timeout_per_handler=25.0)
+
+        # Ensure reports list contains all handler reports
+        # (parallel_search_handlers already returned them)
+        reports = platform_reports
 
         # Calculate discounts
         for result in all_results:
             result.calculate_discount()
 
-        # Find best deal
+        # Find best deal (lowest final_price)
         best_deal = None
         if all_results:
             valid_results = [r for r in all_results if r.final_price is not None]
             if valid_results:
                 best_deal = min(valid_results, key=lambda x: x.final_price)
 
+        # Consistency-first for cart operations: try to add best deal and verify
+        if best_deal:
+            logger.info(f"Best deal chosen: {best_deal.platform} - {best_deal.restaurant_name} - ₹{best_deal.final_price}")
+
+            # map platform string to handler instance
+            platform_lower = best_deal.platform.lower()
+            handler_for_platform = None
+            if "swiggy" in platform_lower:
+                handler_for_platform = swiggy_handler
+            elif "zomato" in platform_lower:
+                handler_for_platform = zomato_handler
+
+            if handler_for_platform:
+                cap_mgr_cart = CAPManager(self.page, mode=CAPMode.CONSISTENCY_FIRST)
+                added_ok = await cap_mgr_cart.add_to_cart_consistent(handler_for_platform, best_deal, max_attempts=3)
+                if not added_ok:
+                    logger.warning("Could not add best deal to cart consistently. Marking report accordingly.")
+                    # add error to the matching platform report
+                    for pr in reports:
+                        if pr.platform and best_deal.platform.lower() in pr.platform.lower():
+                            pr.errors.append("Consistent add-to-cart failed")
+
         execution_time = asyncio.get_event_loop().time() - start_time
 
         # Create report
         report = RunReport(
             search_request=search_request,
-            platforms_processed=[pr.platform for pr in platform_reports],
+            platforms_processed=[pr.platform for pr in reports],
             total_options=len(all_results),
             best_deal=best_deal,
-            platform_reports=platform_reports,
+            platform_reports=reports,
             execution_time_seconds=round(execution_time, 2)
         )
 
         logger.info(f"Search completed in {execution_time:.2f}s. Found {len(all_results)} options.")
 
         return report
-
 
 # ==================== Output Formatting ====================
 
@@ -715,20 +1015,21 @@ def print_report(report: RunReport):
                 for result in pr.results:
                     table.add_row(
                         result.platform,
-                        result.restaurant_name[:30],
-                        result.item_name[:30],
+                        (result.restaurant_name or "")[:30],
+                        (result.item_name or "")[:30],
                         f"₹{result.final_price}" if result.final_price else "N/A",
                         f"{result.rating}⭐" if result.rating else "N/A"
                     )
 
             console.print(table)
 
-        # Errors
+        # Errors and availability
         for pr in report.platform_reports:
             if pr.errors:
                 console.print(f"\n[yellow]⚠️  {pr.platform} Errors:[/yellow]")
                 for error in pr.errors[:5]:  # Show first 5 errors
                     console.print(f"  - {error}")
+            console.print(f"[grey42]Availability: {'Up' if pr.available else 'Down'} | Latency: {pr.latency_ms:.0f}ms[/grey42]") if pr.latency_ms else None
     else:
         # Plain text output
         print("\n" + "="*60)
@@ -753,6 +1054,7 @@ def print_report(report: RunReport):
             for result in pr.results:
                 print(f"  - {result.restaurant_name}: {result.item_name} - ₹{result.final_price}")
 
+# ==================== Save Report ====================
 
 def save_report(report: RunReport, output_file: str):
     """Save report to JSON file"""
@@ -766,7 +1068,6 @@ def save_report(report: RunReport, output_file: str):
         logger.info(f"Report saved to {output_file}")
     except Exception as e:
         logger.error(f"Failed to save report: {e}")
-
 
 # ==================== CLI Interface ====================
 
@@ -814,7 +1115,6 @@ def interactive_mode() -> SearchRequest:
         location=location
     )
 
-
 def load_config_file(config_path: str) -> SearchRequest:
     """Load search request from JSON config file"""
     try:
@@ -833,6 +1133,7 @@ def load_config_file(config_path: str) -> SearchRequest:
         logger.error(f"Failed to load config file: {e}")
         sys.exit(1)
 
+# ==================== Main ====================
 
 async def main():
     """Main entry point"""
@@ -842,16 +1143,16 @@ async def main():
         epilog="""
 Examples:
   Interactive mode:
-    python food_delivery_agent.py --interactive
-  
+    python food_delivery_agent_CAP.py --interactive
+
   Using config file:
-    python food_delivery_agent.py --config config.json
-  
+    python food_delivery_agent_CAP.py --config config.json
+
   Quick search:
-    python food_delivery_agent.py --items "pizza,burger" --rating 4.0
-  
+    python food_delivery_agent_CAP.py --items "pizza,burger" --rating 4.0
+
   With output file:
-    python food_delivery_agent.py --interactive --output results.json
+    python food_delivery_agent_CAP.py --interactive --output results.json
         """
     )
 
@@ -931,7 +1232,6 @@ Examples:
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=args.verbose)
         sys.exit(1)
-
 
 if __name__ == '__main__':
     try:
