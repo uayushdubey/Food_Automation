@@ -437,26 +437,26 @@ class Config:
 
 ```
 User      Agent      CAPMgr     SwiggyH      ZomatoH
- │         │         │         │         │
- │─cmd───▶│         │         │         │
+ │         │         │          │         │
+ │─cmd───▶│          │          │         │
  │         │─init───▶│         │         │
  │         │         │──────parallel──────┐
- │         │         │─init──▶│         │ │
- │         │         │        │◄────────┘ │
- │         │         │─init───────────▶│  │
- │         │         │                 │◄─┘
+ │         │         │─init──▶│          │ │
+ │         │         │         │◄─────────┘
+ │         │         │─init───────────▶│ │
+ │         │         │                 │◄┘
  │         │         │                 │
- │         │         │─search─▶│       
- │         │         │          │─scrape─┐
- │         │         │         │◄────────┘
- │        │         │◄results─ │          │
- │        │         │                     │
- │        │         │─search────────────▶│
- │        │         │                 │─scrape─┐
- │        │         │                 │◄───────┘
- │        │         │◄─────results────│
- │        │◄report──│                 │
- │◄output─│         │                 │
+ │         │         │─search────────▶│       
+ │         │         │                 │─scrape──┐
+ │         │         │                 │◄────────┘
+ │         │         │◄results──────── │          
+ │        │          │                 │
+ │        │          │─search─────────▶│
+ │        │          │                 │─scrape─┐
+ │        │          │                 │◄───────┘
+ │        │          │◄─────results────│
+ │        │◄report── │                 │
+ │◄output─│          │                 │
 ```
 
 ### 3.3 Sequence Diagram: Consistent Cart Add
@@ -744,32 +744,6 @@ class BasePlatformHandler:
     async def remove_item_from_cart(item) -> None:
         """Remove item (rollback)"""
 ```
-
----
-
-## 7. Testing Strategy
-
-### 7.1 Test Coverage
-
-| Component | Test Type | Coverage |
-|-----------|-----------|----------|
-| Data Models | Unit | 100% |
-| Retry Logic | Unit | 100% |
-| CAP Manager | Integration | 85% |
-| Platform Handlers | E2E | Manual |
-
-### 7.2 Manual Testing Checklist
-
-- [ ] Search with single item
-- [ ] Search with multiple items
-- [ ] Price filtering
-- [ ] Rating filtering
-- [ ] One platform unavailable
-- [ ] Both platforms unavailable
-- [ ] Cart add success
-- [ ] Cart add failure + rollback
-- [ ] Session persistence
-- [ ] Headless mode
 
 ---
 
